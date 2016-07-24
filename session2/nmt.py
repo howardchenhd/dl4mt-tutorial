@@ -79,6 +79,7 @@ def load_params(path, params):
 layers = {'ff': ('param_init_fflayer', 'fflayer'),
           'gru': ('param_init_gru', 'gru_layer'),
           'gru_cond': ('param_init_gru_cond', 'gru_cond_layer'),
+          'gru_cover': ('param_init_gru_cover', 'gru_cover_layer'),
           }
 
 
@@ -389,7 +390,7 @@ def param_init_gru_cond(options, params, prefix='gru_cond',
 def gru_cond_layer(tparams, state_below, options, prefix='gru',
                    mask=None, context=None, one_step=False,
                    init_memory=None, init_state=None,
-                   context_mask=None,
+                   context_mask=None, init_cover=None,
                    **kwargs):
 
     assert context, 'Context must be provided'
@@ -514,6 +515,296 @@ def gru_cond_layer(tparams, state_below, options, prefix='gru',
                                     strict=True)
     return rval
 
+def param_init_gru_cover(options, params, prefix='gru_cover',
+                        nin=None, dim=None, dimctx=None,
+                        nin_nonlin=None, dim_nonlin=None):
+    if nin is None:
+        nin = options['dim']
+    if dim is None:
+        dim = options['dim']
+    if dimctx is None:
+        dimctx = options['dim']
+    if nin_nonlin is None:
+        nin_nonlin = nin
+    if dim_nonlin is None:
+        dim_nonlin = dim
+
+    dim_cov = options['dim_cov']
+
+    W = numpy.concatenate([norm_weight(nin, dim),
+                           norm_weight(nin, dim)], axis=1)
+    params[_p(prefix, 'W')] = W
+    params[_p(prefix, 'b')] = numpy.zeros((2 * dim,)).astype('float32')
+    U = numpy.concatenate([ortho_weight(dim_nonlin),
+                           ortho_weight(dim_nonlin)], axis=1)
+    params[_p(prefix, 'U')] = U
+
+    Wx = norm_weight(nin_nonlin, dim_nonlin)
+    params[_p(prefix, 'Wx')] = Wx
+    Ux = ortho_weight(dim_nonlin)
+    params[_p(prefix, 'Ux')] = Ux
+    params[_p(prefix, 'bx')] = numpy.zeros((dim_nonlin,)).astype('float32')
+
+    U_nl = numpy.concatenate([ortho_weight(dim_nonlin),
+                              ortho_weight(dim_nonlin)], axis=1)
+    params[_p(prefix, 'U_nl')] = U_nl
+    params[_p(prefix, 'b_nl')] = numpy.zeros((2 * dim_nonlin,)).astype('float32')
+
+    # coverage update by chend
+    Uc_nl = numpy.concatenate([norm_weight(dim, dim_cov),
+                              norm_weight(dim, dim_cov)], axis=1)
+    params[_p(prefix, 'Uc_nl')] = Uc_nl
+    params[_p(prefix, 'bc_nl')] = numpy.zeros((2 * dim_cov,)).astype('float32')
+
+    U_ncov = ortho_weight(dim_cov)
+    params[_p(prefix, 'U_ncov')] = U_ncov
+    params[_p(prefix, 'b_ncov')] = numpy.zeros((dim_cov,)).astype('float32')
+
+    # attention: coverage -> attention
+    W_cov_att = norm_weight(dim_cov, dimctx)
+    params[_p(prefix, 'W_cov_att')] = W_cov_att
+
+    # coverage: context -> gates
+    Wc_cov = norm_weight(dimctx, 2*dim_cov)
+    params[_p(prefix, 'Wc_cov')] = Wc_cov
+    b_cov = numpy.zeros((2*dim_cov,)).astype('float32')
+    params[_p(prefix, 'b_cov')] = b_cov
+
+    # coverage: alpha -> gates
+    Wa_cov = norm_weight(1, 2*dim_cov)
+    params[_p(prefix, 'Wa_cov')] = Wa_cov
+    # coverage: coverage -> gates
+    U_cov = numpy.concatenate([ortho_weight(dim_cov), ortho_weight(dim_cov)], axis=1)
+    params[_p(prefix, 'U_cov')] = U_cov
+
+    # coverage: hidden -> coverage
+    U_hc = norm_weight(dim, dim_cov)
+    params[_p(prefix, 'U_hc')] = U_hc
+
+    # coverage: context -> coverage
+    W_hc = norm_weight(dimctx, dim_cov)
+    params[_p(prefix, 'W_hc')] = W_hc
+    b_hc = numpy.zeros((dim_cov,)).astype('float32')
+    params[_p(prefix, 'b_hc')] = b_hc
+
+    # coverage: alpha -> coverage
+    W_ac = norm_weight(1, dim_cov)
+    params[_p(prefix, 'W_ac')] = W_ac
+    ###########################
+
+    Ux_nl = ortho_weight(dim_nonlin)
+    params[_p(prefix, 'Ux_nl')] = Ux_nl
+    params[_p(prefix, 'bx_nl')] = numpy.zeros((dim_nonlin,)).astype('float32')
+
+    # context to LSTM
+    Wc = norm_weight(dimctx, dim*2)
+    params[_p(prefix, 'Wc')] = Wc
+
+    Wcx = norm_weight(dimctx, dim)
+    params[_p(prefix, 'Wcx')] = Wcx
+
+    # attention: combined -> hidden
+    W_comb_att = norm_weight(dim, dimctx)
+    params[_p(prefix, 'W_comb_att')] = W_comb_att
+
+    # attention: context -> hidden
+    Wc_att = norm_weight(dimctx)
+    params[_p(prefix, 'Wc_att')] = Wc_att
+
+    # attention: hidden bias
+    b_att = numpy.zeros((dimctx,)).astype('float32')
+    params[_p(prefix, 'b_att')] = b_att
+
+    # attention:
+    U_att = norm_weight(dimctx, 1)
+    params[_p(prefix, 'U_att')] = U_att
+    c_att = numpy.zeros((1,)).astype('float32')
+    params[_p(prefix, 'c_tt')] = c_att
+
+    return params
+
+def gru_cover_layer(tparams, state_below, options, prefix='gru_cover',
+                    mask=None, context=None, one_step=False,
+                    init_memory=None, init_state=None, init_cover=None,
+                    context_mask=None,
+                    **kwargs):
+
+    assert context, 'Context must be provided'
+
+    if one_step:
+        assert init_state, 'previous state must be provided'
+
+    nsteps = state_below.shape[0]
+    if state_below.ndim == 3:
+        n_samples = state_below.shape[1]
+    else:
+        n_samples = 1
+
+    # mask
+    if mask is None:
+        mask = tensor.alloc(1., state_below.shape[0], 1)
+
+    dim = tparams[_p(prefix, 'Wcx')].shape[1]
+    # added by chenhd
+    dim_cov = options['dim_cov']
+
+    #######################
+    # initial/previous state
+    if init_state is None:
+        init_state = tensor.alloc(0., n_samples, dim)
+
+    # projected context
+    assert context.ndim == 3, \
+        'Context must be 3-d: #annotation x #sample x dim'
+    pctx_ = tensor.dot(context, tparams[_p(prefix, 'Wc_att')]) +\
+        tparams[_p(prefix, 'b_att')]
+
+    # n_timstep * n_samples * 2dim_cov
+    pctx_cov = tensor.dot(context, tparams[_p(prefix, 'Wc_cov')]) +\
+        tparams[_p(prefix, 'b_cov')]
+
+    pctx_hc = tensor.dot(context, tparams[_p(prefix, 'W_hc')]) +\
+        tparams[_p(prefix, 'b_hc')]
+
+    def _slice(_x, n, dim):
+        if _x.ndim == 3:
+            return _x[:, :, n*dim:(n+1)*dim]
+        return _x[:, n*dim:(n+1)*dim]
+
+    # projected x
+    state_belowx = tensor.dot(state_below, tparams[_p(prefix, 'Wx')]) +\
+        tparams[_p(prefix, 'bx')]
+    state_below_ = tensor.dot(state_below, tparams[_p(prefix, 'W')]) +\
+        tparams[_p(prefix, 'b')]
+
+    # seqs = [m_ = y_mask, x_ = state_below_, xx_ = state_belowx]
+    # outputs_info = [h_ = init_state, ctx_, alpha_, coverage_]
+    # non_seqs = [pctx_,  context = cc_]+shared_vars
+    def _step_slice(m_, x_, xx_, h_, ctx_, alpha_, coverage_, pctx_, pctx_cov, pctx_hc, cc_,
+                    U, U_cov, Wa_cov, W_ac, Wc, W_comb_att, W_cov_att, U_att, c_tt, Ux, Wcx,
+                    U_nl, Uc_nl, Ux_nl, U_ncov, U_hc, b_nl, bc_nl, bx_nl, b_ncov):
+        preact1 = tensor.dot(h_, U)
+        preact1 += x_
+        preact1 = tensor.nnet.sigmoid(preact1)
+
+        r1 = _slice(preact1, 0, dim)
+        u1 = _slice(preact1, 1, dim)
+
+        preactx1 = tensor.dot(h_, Ux)
+        preactx1 *= r1
+        preactx1 += xx_
+
+        h1 = tensor.tanh(preactx1)
+
+        h1 = u1 * h_ + (1. - u1) * h1
+        h1 = m_[:, None] * h1 + (1. - m_)[:, None] * h_  # n_samples * dim
+
+        # attention
+        pstate_ = tensor.dot(h1, W_comb_att)  # n_samples * 2dim
+        pstatec_ = tensor.dot(coverage_, W_cov_att)  # n_timestep * n_samples * 2dim added by chend
+        pctx__ = pctx_ + pstate_[None, :, :] + pstatec_  # n_timesetp * n_samples * 2dim + 1 * n_samples * 2dim
+        # pctx__ += xc_
+        pctx__ = tensor.tanh(pctx__)            # n_timesetp * n_samples * 2dim
+        alpha = tensor.dot(pctx__, U_att)+c_tt  # n_timestep * n_smaples * 1
+        alpha = alpha.reshape([alpha.shape[0], alpha.shape[1]]) # n_timestep * n_smaples
+        alpha = tensor.exp(alpha)
+        if context_mask:                       # context_mask = x_mask:[n_timestep * n_samples]
+            alpha = alpha * context_mask       # [n_timestep * n_samples]
+        alpha = alpha / alpha.sum(0, keepdims=True)      #alignment weight
+        # cc_ = context:[n_timestep * n_samples *2dim]; alpha[:, :, None] => [n_timestep * n_samples * 1]
+        ctx_ = (cc_ * alpha[:, :, None]).sum(0)          # current context [n_samples *2dim]
+
+
+        preact2 = tensor.dot(h1, U_nl)+b_nl    # U_nl:[dim * 2dim]; preact2=> [n_samples * 2dim]
+        preact2 += tensor.dot(ctx_, Wc)        # Wc: [2dim * 2dim]; preact2=> [n_samples * 2dim]
+        preact2 = tensor.nnet.sigmoid(preact2)
+
+        r2 = _slice(preact2, 0, dim)           # r2 => [n_samples * dim]
+        u2 = _slice(preact2, 1, dim)           # u2 => [n_samples * dim]
+
+        preactx2 = tensor.dot(h1, Ux_nl)+bx_nl        # Ux_nl:[dim * dim]; preactx2=> [n_samples * dim]
+        preactx2 *= r2                                # [n_samples * dim]
+        preactx2 += tensor.dot(ctx_, Wcx)             # Wcx: [(dimctx=2dim) * dim] preactx2 => [n_samples * dim]
+
+        h2 = tensor.tanh(preactx2)
+
+        h2 = u2 * h1 + (1. - u2) * h2
+        h2 = m_[:, None] * h2 + (1. - m_)[:, None] * h1  # h2=>[n_samples * dim]
+
+        # coverage update  by chenhd
+        preact_cov = tensor.dot(coverage_, U_cov)                # n_timestep * n_samples * 2dim_cov
+        preact_cov += (tensor.dot(h_, Uc_nl)+bc_nl)              # + n_samples * 2dim_cov
+        preact_cov += tensor.dot(alpha[:, :, None],  Wa_cov)     # + n_timestep * n_samples * 2dim_cov
+        preact_cov += pctx_cov                                   # + n_timestep * n_samples * 2dim_cov
+        preact_cov = tensor.nnet.sigmoid(preact_cov)
+
+        r_cov = _slice(preact_cov, 0, dim_cov)           # r_cov => [n_timestep * n_samples * dim_cov]
+        u_cov = _slice(preact_cov, 1, dim_cov)           # u_cov => [n_timestep * n_samples * dim_cov]
+
+        preactx_cov = tensor.dot(coverage_, U_ncov) + b_ncov # [n_timestep * n_samples * dim_cov]
+        preactx_cov *= r_cov
+        preactx_cov += tensor.dot(h_, U_hc)                  # + n_samples * dim_cov
+        preactx_cov += pctx_hc                               # + n_timestep * n_samples * dim_cov
+        preactx_cov += tensor.dot(alpha[:, :, None],  W_ac)  # + [n_timestep * n_samples * 1] * [1 * dim_cov]
+
+        coverage_new = tensor.tanh(preactx_cov)
+
+        coverage_new = u_cov * coverage_ + (1. - u_cov) * coverage_new
+
+        if context_mask:
+            coverage_new = coverage_new * context_mask[:, :, None]
+
+        coverage_new = m_[:, None] * coverage_new + (1. - m_)[:, None] * coverage_
+        #############################
+
+
+        return h2, ctx_, alpha.T, coverage_new  # pstate_, preact, preactx, r, u
+
+    seqs = [mask, state_below_, state_belowx]
+    #seqs = [mask, state_below_, state_belowx, state_belowc]
+    _step = _step_slice
+
+    shared_vars = [tparams[_p(prefix, 'U')],
+                   tparams[_p(prefix, 'U_cov')],
+                   tparams[_p(prefix, 'Wa_cov')],
+                   tparams[_p(prefix, 'W_ac')],
+                   tparams[_p(prefix, 'Wc')],
+                   tparams[_p(prefix, 'W_comb_att')],
+                   tparams[_p(prefix, 'W_cov_att')],
+                   tparams[_p(prefix, 'U_att')],
+                   tparams[_p(prefix, 'c_tt')],
+                   tparams[_p(prefix, 'Ux')],
+                   tparams[_p(prefix, 'Wcx')],
+                   tparams[_p(prefix, 'U_nl')],
+                   tparams[_p(prefix, 'Uc_nl')],
+                   tparams[_p(prefix, 'Ux_nl')],
+                   tparams[_p(prefix, 'U_ncov')],
+                   tparams[_p(prefix, 'U_hc')],
+                   tparams[_p(prefix, 'b_nl')],
+                   tparams[_p(prefix, 'bc_nl')],
+                   tparams[_p(prefix, 'bx_nl')],
+                   tparams[_p(prefix, 'b_ncov')]]
+
+    if one_step:
+        rval = _step(*(seqs + [init_state, None, None, init_cover,
+                               pctx_, pctx_cov, pctx_hc, context] +
+                       shared_vars))
+    else:
+        rval, updates = theano.scan(_step,
+                                    sequences=seqs,
+                                    outputs_info=[init_state,
+                                                  tensor.alloc(0., n_samples,
+                                                               context.shape[2]),  # ctx_: [n_samples * (dimctx=2dim)]
+                                                  tensor.alloc(0., n_samples,
+                                                               context.shape[0]),  # alpha.T:[n_samples * n_timestep]
+                                                  tensor.alloc(0., context.shape[0], n_samples,
+                                                               dim_cov)],    # added by chenhd recurrent use
+                                    non_sequences=[pctx_, pctx_cov, pctx_hc, context]+shared_vars,
+                                    name=_p(prefix, '_layers'),
+                                    n_steps=nsteps,
+                                    profile=profile,
+                                    strict=True)
+    return rval
 
 # initialize all parameters
 def init_params(options):
@@ -687,15 +978,26 @@ def build_sampler(tparams, options, trng, use_noise):
     init_state = get_layer('ff')[1](tparams, ctx_mean, options,
                                     prefix='ff_state', activ='tanh')
 
+
+    # for coverage added by chenhd
+    init_cover = None
+    if options['decoder'] == 'gru_cover':
+        init_cover = tensor.alloc(0., ctx_all.shape[0], n_samples, options['dim_cov'])
+    #############################
+    
     print 'Building f_init...',
-    outs = [init_state, ctx]
+    outs = [init_state, ctx, init_cover]
     f_init = theano.function([x], outs, name='f_init', profile=profile)
     print 'Done'
 
     # x: 1 x 1
     y = tensor.vector('y_sampler', dtype='int64')
     init_state = tensor.matrix('init_state', dtype='float32')
-
+    
+    # for coverage added by chenhd
+    init_cover = tensor.tensor3('init_cover', dtype='float32')
+    #############################
+    
     # if it's the first word, emb should be all zero and it is indicated by -1
     emb = tensor.switch(y[:, None] < 0,
                         tensor.alloc(0., 1, tparams['Wemb_dec'].shape[1]),
@@ -706,10 +1008,16 @@ def build_sampler(tparams, options, trng, use_noise):
                                             prefix='decoder',
                                             mask=None, context=ctx,
                                             one_step=True,
-                                            init_state=init_state)
+                                            init_state=init_state, init_cover=init_cover)
     # get the next hidden state
     next_state = proj[0]
-
+    
+    # for coverage added by chenhd
+    next_cover = None
+    if options['decoder'] == 'gru_cover':
+        next_cover = proj[3]
+    #############################
+    
     # get the weighted averages of context for this target word y
     ctxs = proj[1]
 
@@ -734,8 +1042,8 @@ def build_sampler(tparams, options, trng, use_noise):
     # compile a function to do the whole thing above, next word probability,
     # sampled word for the next target, next hidden state to be used
     print 'Building f_next..',
-    inps = [y, ctx, init_state]
-    outs = [next_probs, next_sample, next_state]
+    inps = [y, ctx, init_state, init_cover]
+    outs = [next_probs, next_sample, next_state, next_cover]
     f_next = theano.function(inps, outs, name='f_next', profile=profile)
     print 'Done'
 
@@ -769,10 +1077,23 @@ def gen_sample(tparams, f_init, f_next, x, options, trng=None, k=1, maxlen=30,
     next_state, ctx0 = ret[0], ret[1]
     next_w = -1 * numpy.ones((1,)).astype('int64')  # bos indicator
 
+    # for coverage added by chenhd    
+    next_cover = None
+    if options['decoder'] == 'gru_cover':
+        next_cover = ret[2]
+    timestep = ctx0.shape[0]
+    ###############################
+
     for ii in xrange(maxlen):
         ctx = numpy.tile(ctx0, [live_k, 1])
-        inps = [next_w, ctx, next_state]
+        inps = [next_w, ctx, next_state, next_cover]
         ret = f_next(*inps)
+        
+        # for coverage added by chenhd
+        if options['decoder'] == 'gru_cover':
+            next_cover = ret[3]
+        ###############################
+        
         next_p, next_w, next_state = ret[0], ret[1], ret[2]
 
         if stochastic:
@@ -798,17 +1119,29 @@ def gen_sample(tparams, f_init, f_next, x, options, trng=None, k=1, maxlen=30,
             new_hyp_scores = numpy.zeros(k-dead_k).astype('float32')
             new_hyp_states = []
 
+            # for coverage added by chenhd
+            new_hyp_covers = [[] for ll in xrange(timestep)]              # coverage
+            ###############################  
+              
             for idx, [ti, wi] in enumerate(zip(trans_indices, word_indices)):
                 new_hyp_samples.append(hyp_samples[ti]+[wi])
                 new_hyp_scores[idx] = copy.copy(costs[idx])
                 new_hyp_states.append(copy.copy(next_state[ti]))
-
+                # for coverage added by chenhd
+                if options['decoder'] == 'gru_cover':
+                    for ci in xrange(timestep):
+                        new_hyp_covers[ci].append(copy.copy(next_cover[ci][ti]))    # coverage
+                ###############################
             # check the finished samples
             new_live_k = 0
             hyp_samples = []
             hyp_scores = []
             hyp_states = []
 
+            # for coverage added by chenhd
+            hyp_covers = [[] for ll in xrange(timestep)]                 # coverage
+            ###############################
+            
             for idx in xrange(len(new_hyp_samples)):
                 if new_hyp_samples[idx][-1] == 0:
                     sample.append(new_hyp_samples[idx])
@@ -819,6 +1152,11 @@ def gen_sample(tparams, f_init, f_next, x, options, trng=None, k=1, maxlen=30,
                     hyp_samples.append(new_hyp_samples[idx])
                     hyp_scores.append(new_hyp_scores[idx])
                     hyp_states.append(new_hyp_states[idx])
+                    # for coverage added by chenhd
+                    if options['decoder'] == 'gru_cover':
+                        for ci in xrange(timestep):
+                            hyp_covers[ci].append(new_hyp_covers[ci][idx])    # coverage
+                    ###############################
             hyp_scores = numpy.array(hyp_scores)
             live_k = new_live_k
 
@@ -829,6 +1167,12 @@ def gen_sample(tparams, f_init, f_next, x, options, trng=None, k=1, maxlen=30,
 
             next_w = numpy.array([w[-1] for w in hyp_samples])
             next_state = numpy.array(hyp_states)
+            
+            # for coverage added by chenhd
+            next_cover = numpy.array(hyp_covers[0])[None, :, :]    # coverage
+            for ci in xrange(len(hyp_covers) - 1):
+                next_cover = numpy.concatenate([next_cover, numpy.array(hyp_covers[ci + 1])[None, :, :]], axis=0)
+            ###############################
 
     if not stochastic:
         # dump every remaining one
@@ -982,7 +1326,8 @@ def sgd(lr, tparams, grads, x, mask, y, cost):
 def train(dim_word=100,  # word vector dimensionality
           dim=1000,  # the number of LSTM units
           encoder='gru',
-          decoder='gru_cond',
+          decoder='gru_cover',
+          dim_cover=10,
           patience=10,  # early stopping patience
           max_epochs=5000,
           finish_after=10000000,  # finish after this many updates
