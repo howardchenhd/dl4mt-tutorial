@@ -733,7 +733,7 @@ def gru_cover_layer(tparams, state_below, options, prefix='gru_cover',
 
         # coverage update  by chenhd
         preact_cov = tensor.dot(coverage_, U_cov)                # n_timestep * n_samples * 2dim_cov
-        preact_cov += (tensor.dot(h_, Uc_nl)+bc_nl)              # + n_samples * 2dim_cov
+        preact_cov += (tensor.dot(h1, Uc_nl)+bc_nl)              # + n_samples * 2dim_cov
         preact_cov += tensor.dot(alpha[:, :, None],  Wa_cov)     # + n_timestep * n_samples * 2dim_cov
         preact_cov += pctx_cov                                   # + n_timestep * n_samples * 2dim_cov
         preact_cov = tensor.nnet.sigmoid(preact_cov)
@@ -743,7 +743,7 @@ def gru_cover_layer(tparams, state_below, options, prefix='gru_cover',
 
         preactx_cov = tensor.dot(coverage_, U_ncov) + b_ncov # [n_timestep * n_samples * dim_cov]
         preactx_cov *= r_cov
-        preactx_cov += tensor.dot(h_, U_hc)                  # + n_samples * dim_cov
+        preactx_cov += tensor.dot(h1, U_hc)                  # + n_samples * dim_cov
         preactx_cov += pctx_hc                               # + n_timestep * n_samples * dim_cov
         preactx_cov += tensor.dot(alpha[:, :, None],  W_ac)  # + [n_timestep * n_samples * 1] * [1 * dim_cov]
 
@@ -986,7 +986,9 @@ def build_sampler(tparams, options, trng, use_noise):
     #############################
     
     print 'Building f_init...',
-    outs = [init_state, ctx, init_cover]
+    outs = [init_state, ctx]
+    if options['decoder'] == 'gru_cover':
+        outs.append(init_cover)
     f_init = theano.function([x], outs, name='f_init', profile=profile)
     print 'Done'
 
@@ -995,7 +997,8 @@ def build_sampler(tparams, options, trng, use_noise):
     init_state = tensor.matrix('init_state', dtype='float32')
     
     # for coverage added by chenhd
-    init_cover = tensor.tensor3('init_cover', dtype='float32')
+    if options['decoder'] == 'gru_cover':
+        init_cover = tensor.tensor3('init_cover', dtype='float32')
     #############################
     
     # if it's the first word, emb should be all zero and it is indicated by -1
@@ -1004,11 +1007,18 @@ def build_sampler(tparams, options, trng, use_noise):
                         tparams['Wemb_dec'][y])
 
     # apply one step of conditional gru with attention
-    proj = get_layer(options['decoder'])[1](tparams, emb, options,
+    if options['decoder'] == 'gru_cover':
+        proj = get_layer(options['decoder'])[1](tparams, emb, options,
                                             prefix='decoder',
                                             mask=None, context=ctx,
                                             one_step=True,
                                             init_state=init_state, init_cover=init_cover)
+    else:
+        proj = get_layer(options['decoder'])[1](tparams, emb, options,
+                                            prefix='decoder',
+                                            mask=None, context=ctx,
+                                            one_step=True,
+                                            init_state=init_state)
     # get the next hidden state
     next_state = proj[0]
     
@@ -1042,8 +1052,11 @@ def build_sampler(tparams, options, trng, use_noise):
     # compile a function to do the whole thing above, next word probability,
     # sampled word for the next target, next hidden state to be used
     print 'Building f_next..',
-    inps = [y, ctx, init_state, init_cover]
-    outs = [next_probs, next_sample, next_state, next_cover]
+    inps = [y, ctx, init_state]
+    outs = [next_probs, next_sample, next_state]
+    if options['decoder'] == 'gru_cover':
+        inps.append(init_cover)
+        outs.append(next_cover)         
     f_next = theano.function(inps, outs, name='f_next', profile=profile)
     print 'Done'
 
@@ -1169,9 +1182,10 @@ def gen_sample(tparams, f_init, f_next, x, options, trng=None, k=1, maxlen=30,
             next_state = numpy.array(hyp_states)
             
             # for coverage added by chenhd
-            next_cover = numpy.array(hyp_covers[0])[None, :, :]    # coverage
-            for ci in xrange(len(hyp_covers) - 1):
-                next_cover = numpy.concatenate([next_cover, numpy.array(hyp_covers[ci + 1])[None, :, :]], axis=0)
+            if options['decoder'] == 'gru_cover':
+                next_cover = numpy.array(hyp_covers[0])[None, :, :]    # coverage
+                for ci in xrange(len(hyp_covers) - 1):
+                    next_cover = numpy.concatenate([next_cover, numpy.array(hyp_covers[ci + 1])[None, :, :]], axis=0)
             ###############################
 
     if not stochastic:
